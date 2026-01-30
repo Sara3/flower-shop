@@ -19,7 +19,7 @@ from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp.types import Tool, TextContent
 from starlette.applications import Starlette
-from starlette.routing import Route
+from starlette.routing import Route, Mount
 from starlette.responses import JSONResponse
 
 
@@ -99,6 +99,60 @@ class UCPClient:
         resp = await self.client.get(f"{self.base_url}/api/ucp/orders")
         resp.raise_for_status()
         return resp.json()
+
+
+# ============ LOCAL CHECKOUT SESSION MANAGER ============
+# Simulates multi-step checkout for backends that only support single-step
+import uuid
+from datetime import datetime
+
+class CheckoutSessionManager:
+    """Manages local checkout sessions for multi-step checkout workflow."""
+    
+    def __init__(self):
+        self.sessions: dict[str, dict] = {}
+    
+    def create(self, line_items: list[dict]) -> dict:
+        """Create a new checkout session."""
+        checkout_id = f"checkout_{uuid.uuid4().hex[:12]}"
+        session = {
+            "checkout_id": checkout_id,
+            "status": "pending",
+            "line_items": line_items,
+            "buyer": None,
+            "shipping_address": None,
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        self.sessions[checkout_id] = session
+        return session
+    
+    def get(self, checkout_id: str) -> dict | None:
+        """Get a checkout session."""
+        return self.sessions.get(checkout_id)
+    
+    def update(self, checkout_id: str, updates: dict) -> dict | None:
+        """Update a checkout session."""
+        session = self.sessions.get(checkout_id)
+        if not session:
+            return None
+        
+        if "buyer" in updates:
+            if session["buyer"] is None:
+                session["buyer"] = {}
+            session["buyer"].update(updates["buyer"])
+        if "shipping_address" in updates:
+            session["shipping_address"] = updates["shipping_address"]
+        
+        session["updated_at"] = datetime.utcnow().isoformat()
+        return session
+    
+    def remove(self, checkout_id: str):
+        """Remove a completed checkout session."""
+        self.sessions.pop(checkout_id, None)
+
+
+checkout_manager = CheckoutSessionManager()
 
 
 ucp = UCPClient()
@@ -201,6 +255,92 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {},
                 "required": []
+            }
+        ),
+        # Multi-step checkout workflow tools
+        Tool(
+            name="ucp_create_checkout",
+            description="Create a new checkout session. Returns a checkout_id to use in subsequent steps.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "product_id": {
+                        "type": "string",
+                        "description": "Product ID to add to checkout"
+                    },
+                    "quantity": {
+                        "type": "integer",
+                        "description": "Quantity (default: 1)",
+                        "default": 1
+                    }
+                },
+                "required": ["product_id"]
+            }
+        ),
+        Tool(
+            name="ucp_get_checkout",
+            description="Get the current state of a checkout session.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "checkout_id": {
+                        "type": "string",
+                        "description": "The checkout session ID"
+                    }
+                },
+                "required": ["checkout_id"]
+            }
+        ),
+        Tool(
+            name="ucp_update_checkout",
+            description="Update a checkout session with buyer information, shipping address, etc.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "checkout_id": {
+                        "type": "string",
+                        "description": "The checkout session ID"
+                    },
+                    "buyer_name": {
+                        "type": "string",
+                        "description": "Buyer's full name"
+                    },
+                    "buyer_email": {
+                        "type": "string",
+                        "description": "Buyer's email address"
+                    },
+                    "shipping_address": {
+                        "type": "object",
+                        "description": "Shipping address object",
+                        "properties": {
+                            "street": {"type": "string"},
+                            "city": {"type": "string"},
+                            "state": {"type": "string"},
+                            "zip": {"type": "string"},
+                            "country": {"type": "string"}
+                        }
+                    }
+                },
+                "required": ["checkout_id"]
+            }
+        ),
+        Tool(
+            name="ucp_submit_checkout",
+            description="Submit the checkout to complete the purchase. Returns order confirmation and fulfillment details.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "checkout_id": {
+                        "type": "string",
+                        "description": "The checkout session ID"
+                    },
+                    "payment_token": {
+                        "type": "string",
+                        "description": "Payment token (use 'sandbox_test' for testing)",
+                        "default": "sandbox_test"
+                    }
+                },
+                "required": ["checkout_id"]
             }
         )
     ]
@@ -308,6 +448,108 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 text=f"Orders:\n\n```json\n{json.dumps(result, indent=2)}\n```"
             )]
         
+        # Multi-step checkout workflow handlers (using local session manager)
+        elif name == "ucp_create_checkout":
+            line_items = [{
+                "product_id": arguments["product_id"],
+                "quantity": arguments.get("quantity", 1)
+            }]
+            session = checkout_manager.create(line_items)
+            
+            output = f"**Checkout Created**\n\n"
+            output += f"Checkout ID: `{session['checkout_id']}`\n"
+            output += f"Status: {session['status']}\n\n"
+            output += f"Next steps:\n"
+            output += f"1. Use `ucp_update_checkout` to add buyer info (optional)\n"
+            output += f"2. Use `ucp_submit_checkout` to complete the purchase\n\n"
+            output += f"```json\n{json.dumps(session, indent=2)}\n```"
+            
+            return [TextContent(type="text", text=output)]
+        
+        elif name == "ucp_get_checkout":
+            session = checkout_manager.get(arguments["checkout_id"])
+            if not session:
+                return [TextContent(
+                    type="text",
+                    text=f"Checkout session `{arguments['checkout_id']}` not found or expired."
+                )]
+            return [TextContent(
+                type="text",
+                text=f"Checkout Details:\n\n```json\n{json.dumps(session, indent=2)}\n```"
+            )]
+        
+        elif name == "ucp_update_checkout":
+            checkout_id = arguments["checkout_id"]
+            session = checkout_manager.get(checkout_id)
+            if not session:
+                return [TextContent(
+                    type="text",
+                    text=f"Checkout session `{checkout_id}` not found or expired."
+                )]
+            
+            updates = {}
+            if arguments.get("buyer_name") or arguments.get("buyer_email"):
+                updates["buyer"] = {}
+                if arguments.get("buyer_name"):
+                    updates["buyer"]["name"] = arguments["buyer_name"]
+                if arguments.get("buyer_email"):
+                    updates["buyer"]["email"] = arguments["buyer_email"]
+            if arguments.get("shipping_address"):
+                updates["shipping_address"] = arguments["shipping_address"]
+            
+            session = checkout_manager.update(checkout_id, updates)
+            
+            output = f"**Checkout Updated**\n\n"
+            output += f"Checkout ID: `{checkout_id}`\n"
+            output += f"Status: {session['status']}\n\n"
+            output += f"```json\n{json.dumps(session, indent=2)}\n```"
+            
+            return [TextContent(type="text", text=output)]
+        
+        elif name == "ucp_submit_checkout":
+            checkout_id = arguments["checkout_id"]
+            session = checkout_manager.get(checkout_id)
+            if not session:
+                return [TextContent(
+                    type="text",
+                    text=f"Checkout session `{checkout_id}` not found or expired."
+                )]
+            
+            payment_token = arguments.get("payment_token", "sandbox_test")
+            
+            # Call the real single-step checkout endpoint
+            result = await ucp.checkout(
+                line_items=session["line_items"],
+                buyer=session.get("buyer"),
+                payment_token=payment_token
+            )
+            
+            # Clean up the session
+            checkout_manager.remove(checkout_id)
+            
+            order_id = result.get("order_id", "N/A")
+            status = result.get("status", "unknown")
+            
+            output = f"**Order Complete!**\n\n"
+            output += f"Order ID: `{order_id}`\n"
+            output += f"Status: {status}\n\n"
+            
+            # Show fulfillment info
+            fulfillment = result.get("fulfillment", [])
+            if fulfillment:
+                output += "**Fulfillment:**\n"
+                for f in fulfillment:
+                    if f.get("download_url"):
+                        output += f"  Download: {UCP_BASE_URL}{f['download_url']}\n"
+                    if f.get("tracking_number"):
+                        output += f"  Tracking: {f['tracking_number']}\n"
+                    if f.get("confirmation_code"):
+                        output += f"  Confirmation: {f['confirmation_code']}\n"
+            
+            output += f"\n```json\n{json.dumps(result, indent=2)}\n```"
+            
+            return [TextContent(type="text", text=output)]
+        
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
     
@@ -330,16 +572,13 @@ sse_transport = SseServerTransport("/messages")
 
 
 async def handle_sse(request):
+    """Handle SSE connection for MCP."""
     async with sse_transport.connect_sse(
         request.scope, request.receive, request._send
     ) as streams:
         await server.run(
             streams[0], streams[1], server.create_initialization_options()
         )
-
-
-async def handle_messages(request):
-    await sse_transport.handle_post_message(request.scope, request.receive, request._send)
 
 
 async def handle_health(request):
@@ -359,19 +598,47 @@ async def handle_info(request):
             "ucp_get_product",
             "ucp_checkout",
             "ucp_get_order",
-            "ucp_list_orders"
+            "ucp_list_orders",
+            "ucp_create_checkout",
+            "ucp_get_checkout",
+            "ucp_update_checkout",
+            "ucp_submit_checkout"
         ]
     })
 
 
+async def handle_root(request):
+    """Root endpoint with usage info."""
+    return JSONResponse({
+        "name": "UCP MCP Server",
+        "description": "MCP Server for Universal Commerce Protocol",
+        "endpoints": {
+            "sse": "/sse - SSE endpoint for MCP clients",
+            "messages": "/messages - POST endpoint for MCP messages",
+            "health": "/health - Health check",
+            "info": "/info - Server info and available tools"
+        },
+        "ucp_backend": UCP_BASE_URL
+    })
+
+
+# Create a raw ASGI app for /messages that doesn't interfere with SSE transport
+class MessagesEndpoint:
+    """ASGI app for handling MCP POST messages."""
+    
+    async def __call__(self, scope, receive, send):
+        await sse_transport.handle_post_message(scope, receive, send)
+
+
+# Build the Starlette app with Mount for the messages endpoint
 app = Starlette(
     debug=True,
     routes=[
+        Route("/", handle_root),
         Route("/health", handle_health),
         Route("/info", handle_info),
         Route("/sse", handle_sse),
-        Route("/messages", handle_messages, methods=["POST"]),
-        Route("/messages/", handle_messages, methods=["POST"]),
+        Mount("/messages", app=MessagesEndpoint()),
     ]
 )
 
@@ -383,7 +650,7 @@ if __name__ == "__main__":
     
     print(f"""
 ╔══════════════════════════════════════════════════════════════════╗
-║                  🛒 UCP MCP Server                               ║
+║                  UCP MCP Server                                  ║
 ║                                                                  ║
 ║  SSE Endpoint:  http://localhost:{port}/sse                        ║
 ║  Health:        http://localhost:{port}/health                     ║
@@ -392,12 +659,18 @@ if __name__ == "__main__":
 ║  UCP Merchant:  {UCP_BASE_URL:<44} ║
 ║                                                                  ║
 ║  Tools:                                                          ║
-║    • ucp_discover      - Get merchant info & capabilities        ║
-║    • ucp_list_products - Browse product catalog                  ║
-║    • ucp_get_product   - Get product details                     ║
-║    • ucp_checkout      - Purchase a product                      ║
-║    • ucp_get_order     - View order details                      ║
-║    • ucp_list_orders   - List all orders                         ║
+║    • ucp_discover        - Get merchant info & capabilities      ║
+║    • ucp_list_products   - Browse product catalog                ║
+║    • ucp_get_product     - Get product details                   ║
+║    • ucp_checkout        - Quick one-step purchase               ║
+║    • ucp_get_order       - View order details                    ║
+║    • ucp_list_orders     - List all orders                       ║
+║                                                                  ║
+║  Multi-step Checkout:                                            ║
+║    • ucp_create_checkout - Start checkout session                ║
+║    • ucp_get_checkout    - Get checkout state                    ║
+║    • ucp_update_checkout - Add buyer/shipping info               ║
+║    • ucp_submit_checkout - Complete the purchase                 ║
 ║                                                                  ║
 ║  Set UCP_BASE_URL env var to connect to a different merchant     ║
 ╚══════════════════════════════════════════════════════════════════╝
