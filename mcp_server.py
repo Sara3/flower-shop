@@ -468,6 +468,9 @@ def create_app():
                 streams[0], streams[1], server.create_initialization_options()
             )
     
+    async def handle_messages(request):
+        await sse.handle_post_message(request.scope, request.receive, request._send)
+    
     async def handle_health(request):
         return JSONResponse({"status": "ok", "server": "ucp-flower-shop"})
     
@@ -497,6 +500,7 @@ def create_app():
             Route("/health", handle_health),
             Route("/info", handle_info),
             Route("/sse", handle_sse),
+            Route("/messages/", handle_messages, methods=["POST"]),
         ]
     )
 
