@@ -19,7 +19,7 @@ from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp.types import Tool, TextContent
 from starlette.applications import Starlette
-from starlette.routing import Route, Mount
+from starlette.routing import Route
 from starlette.responses import JSONResponse
 
 
@@ -622,25 +622,39 @@ async def handle_root(request):
     })
 
 
-# Create a raw ASGI app for /messages that doesn't interfere with SSE transport
-class MessagesEndpoint:
-    """ASGI app for handling MCP POST messages."""
-    
-    async def __call__(self, scope, receive, send):
-        await sse_transport.handle_post_message(scope, receive, send)
-
-
-# Build the Starlette app with Mount for the messages endpoint
-app = Starlette(
+# Build the Starlette app (without /messages - we'll handle that separately)
+starlette_app = Starlette(
     debug=True,
     routes=[
         Route("/", handle_root),
         Route("/health", handle_health),
         Route("/info", handle_info),
         Route("/sse", handle_sse),
-        Mount("/messages", app=MessagesEndpoint()),
     ]
 )
+
+
+# Custom ASGI wrapper that intercepts /messages before Starlette
+class McpAsgiApp:
+    """ASGI app that handles /messages directly, passes other routes to Starlette."""
+    
+    def __init__(self, starlette_app):
+        self.starlette_app = starlette_app
+    
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            # Handle /messages and /messages/ directly without Starlette
+            if path == "/messages" or path.startswith("/messages?") or path.startswith("/messages/"):
+                await sse_transport.handle_post_message(scope, receive, send)
+                return
+        
+        # All other requests go to Starlette
+        await self.starlette_app(scope, receive, send)
+
+
+# The main ASGI app
+app = McpAsgiApp(starlette_app)
 
 
 if __name__ == "__main__":
