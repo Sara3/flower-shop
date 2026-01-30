@@ -1,21 +1,18 @@
 """
 UCP Flower Shop MCP Server (HTTP/SSE Transport)
 
-Wraps the UCP REST API as MCP tools for Claude Desktop / MCP Inspector / Playground.
+Standalone MCP server with built-in mock flower shop data.
+No external backend required - works as a complete demo.
 
-Run UCP flower shop first:
-  cd samples/rest/python/server
-  uv run server.py --port=8182 --products_db_path=/tmp/ucp/products.db --transactions_db_path=/tmp/ucp/transactions.db
-
-Then run this MCP server:
+Run:
   python mcp_server.py
   
 Connect via: http://localhost:8000/sse
 """
 
 import json
-import httpx
 import uuid
+from datetime import datetime
 from typing import Any
 
 from mcp.server import Server
@@ -27,135 +24,292 @@ from starlette.responses import JSONResponse
 import os
 
 
-# ============ CONFIG ============
-UCP_BASE_URL = os.environ.get("UCP_BASE_URL", "http://localhost:8182")
+# ============ MOCK DATA ============
+MOCK_PRODUCTS = {
+    "bouquet_roses": {
+        "id": "bouquet_roses",
+        "title": "Bouquet of Red Roses",
+        "description": "A stunning arrangement of 12 fresh red roses, perfect for any romantic occasion.",
+        "price": {"amount": 35.00, "currency": "USD"},
+        "image_url": "https://example.com/roses.jpg",
+        "in_stock": True
+    },
+    "orchid_white": {
+        "id": "orchid_white",
+        "title": "White Phalaenopsis Orchid",
+        "description": "Elegant potted white orchid, long-lasting and easy to care for.",
+        "price": {"amount": 45.00, "currency": "USD"},
+        "image_url": "https://example.com/orchid.jpg",
+        "in_stock": True
+    },
+    "tulips_mixed": {
+        "id": "tulips_mixed",
+        "title": "Mixed Tulip Bouquet",
+        "description": "Cheerful mix of 15 colorful tulips in spring colors.",
+        "price": {"amount": 28.00, "currency": "USD"},
+        "image_url": "https://example.com/tulips.jpg",
+        "in_stock": True
+    },
+    "succulent_trio": {
+        "id": "succulent_trio",
+        "title": "Succulent Trio",
+        "description": "Three adorable succulents in decorative pots. Low maintenance, high style.",
+        "price": {"amount": 22.00, "currency": "USD"},
+        "image_url": "https://example.com/succulents.jpg",
+        "in_stock": True
+    },
+    "sunflower_bunch": {
+        "id": "sunflower_bunch",
+        "title": "Sunflower Sunshine Bunch",
+        "description": "Bright and cheerful bunch of 6 large sunflowers.",
+        "price": {"amount": 25.00, "currency": "USD"},
+        "image_url": "https://example.com/sunflowers.jpg",
+        "in_stock": True
+    },
+    "lily_bouquet": {
+        "id": "lily_bouquet",
+        "title": "Stargazer Lily Bouquet",
+        "description": "Fragrant pink stargazer lilies with eucalyptus accents.",
+        "price": {"amount": 42.00, "currency": "USD"},
+        "image_url": "https://example.com/lilies.jpg",
+        "in_stock": True
+    },
+    "pothos_golden": {
+        "id": "pothos_golden",
+        "title": "Golden Pothos Plant",
+        "description": "Easy-care trailing plant, perfect for beginners. Comes in a 6-inch pot.",
+        "price": {"amount": 18.00, "currency": "USD"},
+        "image_url": "https://example.com/pothos.jpg",
+        "in_stock": True
+    },
+    "peace_lily": {
+        "id": "peace_lily",
+        "title": "Peace Lily",
+        "description": "Classic indoor plant with elegant white blooms. Air-purifying.",
+        "price": {"amount": 32.00, "currency": "USD"},
+        "image_url": "https://example.com/peace_lily.jpg",
+        "in_stock": True
+    }
+}
+
+MOCK_DISCOVERY = {
+    "ucp": {
+        "version": "2026-01-11",
+        "services": {
+            "dev.ucp.shopping": {
+                "version": "2026-01-11",
+                "spec": "https://ucp.dev/specs/shopping",
+                "rest": {
+                    "schema": "https://ucp.dev/services/shopping/openapi.json",
+                    "endpoint": "https://flower-shop.example.com/"
+                }
+            }
+        },
+        "capabilities": [
+            {
+                "name": "dev.ucp.shopping.checkout",
+                "version": "2026-01-11",
+                "spec": "https://ucp.dev/specs/shopping/checkout"
+            },
+            {
+                "name": "dev.ucp.shopping.discount",
+                "version": "2026-01-11",
+                "spec": "https://ucp.dev/specs/shopping/discount",
+                "extends": "dev.ucp.shopping.checkout"
+            },
+            {
+                "name": "dev.ucp.shopping.fulfillment",
+                "version": "2026-01-11",
+                "spec": "https://ucp.dev/specs/shopping/fulfillment",
+                "extends": "dev.ucp.shopping.checkout"
+            }
+        ]
+    },
+    "payment": {
+        "handlers": [
+            {
+                "id": "mock_payment",
+                "name": "dev.ucp.mock_payment",
+                "version": "2026-01-11",
+                "config": {"supported_tokens": ["sandbox_test", "success_token"]}
+            }
+        ]
+    }
+}
+
+DISCOUNT_CODES = {
+    "10OFF": {"title": "10% Off", "percent": 10},
+    "FLOWERS20": {"title": "20% Off Flowers", "percent": 20},
+    "FREESHIP": {"title": "Free Shipping", "amount": 5.99}
+}
+
+# In-memory stores
+checkouts: dict[str, dict] = {}
+orders: dict[str, dict] = {}
 
 
-# ============ UCP REST CLIENT ============
-class UCPClient:
-    """Wraps UCP REST API calls"""
-    
-    def __init__(self, base_url: str = UCP_BASE_URL):
-        self.base_url = base_url
-        self.client = httpx.AsyncClient(timeout=30.0)
-    
-    def _headers(self) -> dict:
-        """Standard UCP headers"""
-        return {
-            "Content-Type": "application/json",
-            "UCP-Agent": 'profile="https://mcp.example/agent"',
-            "request-signature": "test",
-            "idempotency-key": str(uuid.uuid4()),
-            "request-id": str(uuid.uuid4()),
-        }
-    
-    async def discover(self) -> dict:
-        """GET /.well-known/ucp - Discover merchant capabilities"""
-        resp = await self.client.get(f"{self.base_url}/.well-known/ucp")
-        resp.raise_for_status()
-        return resp.json()
-    
-    async def list_products(self) -> list[dict]:
-        """GET /products - List available products"""
-        resp = await self.client.get(
-            f"{self.base_url}/products",
-            headers=self._headers()
-        )
-        resp.raise_for_status()
-        return resp.json()
-    
-    async def get_product(self, product_id: str) -> dict:
-        """GET /products/{id} - Get product details"""
-        resp = await self.client.get(
-            f"{self.base_url}/products/{product_id}",
-            headers=self._headers()
-        )
-        resp.raise_for_status()
-        return resp.json()
-    
-    async def create_checkout(
-        self,
-        line_items: list[dict],
-        buyer: dict | None = None,
-        currency: str = "USD"
-    ) -> dict:
-        """POST /checkout-sessions - Create a checkout session"""
-        payload = {
-            "line_items": line_items,
-            "currency": currency,
-        }
-        if buyer:
-            payload["buyer"] = buyer
-            
-        resp = await self.client.post(
-            f"{self.base_url}/checkout-sessions",
-            headers=self._headers(),
-            json=payload
-        )
-        resp.raise_for_status()
-        return resp.json()
-    
-    async def get_checkout(self, checkout_id: str) -> dict:
-        """GET /checkout-sessions/{id} - Get checkout session"""
-        resp = await self.client.get(
-            f"{self.base_url}/checkout-sessions/{checkout_id}",
-            headers=self._headers()
-        )
-        resp.raise_for_status()
-        return resp.json()
-    
-    async def update_checkout(
-        self,
-        checkout_id: str,
-        updates: dict
-    ) -> dict:
-        """PATCH /checkout-sessions/{id} - Update checkout (add shipping, discounts, etc)"""
-        resp = await self.client.patch(
-            f"{self.base_url}/checkout-sessions/{checkout_id}",
-            headers=self._headers(),
-            json=updates
-        )
-        resp.raise_for_status()
-        return resp.json()
-    
-    async def submit_checkout(
-        self,
-        checkout_id: str,
-        payment: dict | None = None
-    ) -> dict:
-        """POST /checkout-sessions/{id}/submit - Complete the purchase"""
-        payload = {}
-        if payment:
-            payload["payment"] = payment
-            
-        resp = await self.client.post(
-            f"{self.base_url}/checkout-sessions/{checkout_id}/submit",
-            headers=self._headers(),
-            json=payload
-        )
-        resp.raise_for_status()
-        return resp.json()
-    
-    async def get_order(self, order_id: str) -> dict:
-        """GET /orders/{id} - Get order details"""
-        resp = await self.client.get(
-            f"{self.base_url}/orders/{order_id}",
-            headers=self._headers()
-        )
-        resp.raise_for_status()
-        return resp.json()
-    
-    async def list_orders(self) -> list[dict]:
-        """GET /orders - List orders"""
-        resp = await self.client.get(
-            f"{self.base_url}/orders",
-            headers=self._headers()
-        )
-        resp.raise_for_status()
-        return resp.json()
+# ============ MOCK UCP FUNCTIONS ============
+def mock_discover() -> dict:
+    return MOCK_DISCOVERY
 
 
-ucp = UCPClient()
+def mock_list_products() -> list[dict]:
+    return list(MOCK_PRODUCTS.values())
+
+
+def mock_get_product(product_id: str) -> dict | None:
+    return MOCK_PRODUCTS.get(product_id)
+
+
+def mock_create_checkout(
+    line_items: list[dict],
+    buyer: dict | None = None,
+    currency: str = "USD"
+) -> dict:
+    checkout_id = str(uuid.uuid4())
+    
+    # Calculate line item totals
+    processed_items = []
+    subtotal = 0
+    
+    for item in line_items:
+        product_id = item.get("item", {}).get("id")
+        quantity = item.get("quantity", 1)
+        product = MOCK_PRODUCTS.get(product_id)
+        
+        if product:
+            item_total = product["price"]["amount"] * quantity
+            subtotal += item_total
+            processed_items.append({
+                "id": str(uuid.uuid4()),
+                "item": {
+                    "id": product_id,
+                    "title": product["title"],
+                    "price": product["price"]["amount"]
+                },
+                "quantity": quantity,
+                "totals": [
+                    {"type": "subtotal", "amount": item_total},
+                    {"type": "total", "amount": item_total}
+                ]
+            })
+    
+    checkout = {
+        "id": checkout_id,
+        "status": "pending",
+        "currency": currency,
+        "line_items": processed_items,
+        "buyer": buyer or {},
+        "totals": [
+            {"type": "subtotal", "amount": subtotal},
+            {"type": "total", "amount": subtotal}
+        ],
+        "discounts": {"codes": [], "applied": []},
+        "fulfillment": None,
+        "created_at": datetime.utcnow().isoformat()
+    }
+    
+    checkouts[checkout_id] = checkout
+    return checkout
+
+
+def mock_get_checkout(checkout_id: str) -> dict | None:
+    return checkouts.get(checkout_id)
+
+
+def mock_update_checkout(checkout_id: str, updates: dict) -> dict | None:
+    checkout = checkouts.get(checkout_id)
+    if not checkout:
+        return None
+    
+    # Handle fulfillment/shipping
+    if "fulfillment" in updates:
+        checkout["fulfillment"] = updates["fulfillment"]
+        # Add shipping cost
+        shipping_cost = 5.99
+        totals = checkout["totals"]
+        subtotal = next((t["amount"] for t in totals if t["type"] == "subtotal"), 0)
+        discount = next((t["amount"] for t in totals if t["type"] == "discount"), 0)
+        checkout["totals"] = [
+            {"type": "subtotal", "amount": subtotal},
+            {"type": "shipping", "amount": shipping_cost},
+            {"type": "discount", "amount": discount} if discount else None,
+            {"type": "total", "amount": subtotal + shipping_cost - discount}
+        ]
+        checkout["totals"] = [t for t in checkout["totals"] if t]
+    
+    # Handle discount codes
+    if "discount" in updates:
+        codes = updates["discount"].get("codes", [])
+        applied = []
+        total_discount = 0
+        subtotal = next((t["amount"] for t in checkout["totals"] if t["type"] == "subtotal"), 0)
+        
+        for code in codes:
+            if code.upper() in DISCOUNT_CODES:
+                disc = DISCOUNT_CODES[code.upper()]
+                if "percent" in disc:
+                    amount = subtotal * disc["percent"] / 100
+                else:
+                    amount = disc.get("amount", 0)
+                total_discount += amount
+                applied.append({
+                    "code": code.upper(),
+                    "title": disc["title"],
+                    "amount": amount
+                })
+        
+        checkout["discounts"] = {"codes": codes, "applied": applied}
+        
+        # Recalculate totals
+        shipping = next((t["amount"] for t in checkout["totals"] if t["type"] == "shipping"), 0)
+        checkout["totals"] = [
+            {"type": "subtotal", "amount": subtotal},
+            {"type": "shipping", "amount": shipping} if shipping else None,
+            {"type": "discount", "amount": total_discount} if total_discount else None,
+            {"type": "total", "amount": subtotal + shipping - total_discount}
+        ]
+        checkout["totals"] = [t for t in checkout["totals"] if t]
+    
+    checkout["status"] = "ready_for_complete"
+    return checkout
+
+
+def mock_submit_checkout(checkout_id: str, payment: dict | None = None) -> dict | None:
+    checkout = checkouts.get(checkout_id)
+    if not checkout:
+        return None
+    
+    order_id = f"ORD-{str(uuid.uuid4())[:8].upper()}"
+    
+    order = {
+        "id": order_id,
+        "status": "confirmed",
+        "checkout_id": checkout_id,
+        "line_items": checkout["line_items"],
+        "buyer": checkout["buyer"],
+        "totals": checkout["totals"],
+        "fulfillment": checkout["fulfillment"],
+        "payment": {
+            "status": "captured",
+            "method": "mock_payment"
+        },
+        "created_at": datetime.utcnow().isoformat()
+    }
+    
+    orders[order_id] = order
+    checkout["status"] = "completed"
+    checkout["order_id"] = order_id
+    
+    return order
+
+
+def mock_get_order(order_id: str) -> dict | None:
+    return orders.get(order_id)
+
+
+def mock_list_orders() -> list[dict]:
+    return list(orders.values())
 
 
 # ============ MCP SERVER ============
@@ -196,7 +350,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "product_id": {
                         "type": "string",
-                        "description": "The product ID (e.g., 'bouquet_roses')"
+                        "description": "The product ID (e.g., 'bouquet_roses', 'orchid_white', 'pothos_golden')"
                     }
                 },
                 "required": ["product_id"]
@@ -245,7 +399,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="ucp_update_checkout",
-            description="Update a checkout session with shipping address or other details.",
+            description="Update a checkout session with shipping address or discount code. Available codes: 10OFF, FLOWERS20, FREESHIP",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -268,7 +422,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "discount_code": {
                         "type": "string",
-                        "description": "Optional discount code to apply"
+                        "description": "Discount code to apply (e.g., '10OFF', 'FLOWERS20', 'FREESHIP')"
                     }
                 },
                 "required": ["checkout_id"]
@@ -323,14 +477,14 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
         if name == "ucp_discover":
-            result = await ucp.discover()
+            result = mock_discover()
             return [TextContent(
                 type="text",
                 text=f"UCP Discovery Profile:\n\n```json\n{json.dumps(result, indent=2)}\n```"
             )]
         
         elif name == "ucp_list_products":
-            products = await ucp.list_products()
+            products = mock_list_products()
             max_price = arguments.get("max_price")
             
             if max_price:
@@ -339,7 +493,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if not products:
                 return [TextContent(type="text", text="No products found.")]
             
-            result = "🌸 Available Products:\n\n"
+            result = "🌸 **Flower Shop Catalog**\n\n"
             for p in products:
                 price = p.get("price", {})
                 amount = price.get("amount", 0)
@@ -347,13 +501,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 result += f"**{p.get('title', 'Unknown')}** - ${amount:.2f} {currency}\n"
                 result += f"  ID: `{p.get('id')}`\n"
                 if p.get("description"):
-                    result += f"  {p.get('description')}\n"
+                    result += f"  _{p.get('description')}_\n"
                 result += "\n"
             
             return [TextContent(type="text", text=result)]
         
         elif name == "ucp_get_product":
-            product = await ucp.get_product(arguments["product_id"])
+            product = mock_get_product(arguments["product_id"])
+            if not product:
+                return [TextContent(type="text", text=f"❌ Product not found: {arguments['product_id']}")]
             return [TextContent(
                 type="text",
                 text=f"Product Details:\n\n```json\n{json.dumps(product, indent=2)}\n```"
@@ -372,8 +528,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     "email": arguments.get("buyer_email", "")
                 }
             
-            result = await ucp.create_checkout(line_items, buyer)
-            checkout_id = result.get("id") or result.get("checkout_id")
+            result = mock_create_checkout(line_items, buyer)
+            checkout_id = result.get("id")
             
             return [TextContent(
                 type="text",
@@ -381,7 +537,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )]
         
         elif name == "ucp_get_checkout":
-            result = await ucp.get_checkout(arguments["checkout_id"])
+            result = mock_get_checkout(arguments["checkout_id"])
+            if not result:
+                return [TextContent(type="text", text=f"❌ Checkout not found: {arguments['checkout_id']}")]
             return [TextContent(
                 type="text",
                 text=f"Checkout Session:\n\n```json\n{json.dumps(result, indent=2)}\n```"
@@ -403,7 +561,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     "codes": [arguments["discount_code"]]
                 }
             
-            result = await ucp.update_checkout(arguments["checkout_id"], updates)
+            result = mock_update_checkout(arguments["checkout_id"], updates)
+            if not result:
+                return [TextContent(type="text", text=f"❌ Checkout not found: {arguments['checkout_id']}")]
             return [TextContent(
                 type="text",
                 text=f"✅ Checkout updated!\n\n```json\n{json.dumps(result, indent=2)}\n```"
@@ -417,8 +577,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 }]
             }
             
-            result = await ucp.submit_checkout(arguments["checkout_id"], payment)
-            order_id = result.get("id") or result.get("order_id")
+            result = mock_submit_checkout(arguments["checkout_id"], payment)
+            if not result:
+                return [TextContent(type="text", text=f"❌ Checkout not found: {arguments['checkout_id']}")]
+            order_id = result.get("id")
             
             return [TextContent(
                 type="text",
@@ -426,32 +588,26 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )]
         
         elif name == "ucp_get_order":
-            result = await ucp.get_order(arguments["order_id"])
+            result = mock_get_order(arguments["order_id"])
+            if not result:
+                return [TextContent(type="text", text=f"❌ Order not found: {arguments['order_id']}")]
             return [TextContent(
                 type="text",
                 text=f"Order Details:\n\n```json\n{json.dumps(result, indent=2)}\n```"
             )]
         
         elif name == "ucp_list_orders":
-            result = await ucp.list_orders()
+            result = mock_list_orders()
+            if not result:
+                return [TextContent(type="text", text="No orders yet.")]
             return [TextContent(
                 type="text",
-                text=f"Orders:\n\n```json\n{json.dumps(result, indent=2)}\n```"
+                text=f"Orders ({len(result)} total):\n\n```json\n{json.dumps(result, indent=2)}\n```"
             )]
         
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
     
-    except httpx.HTTPStatusError as e:
-        return [TextContent(
-            type="text",
-            text=f"❌ UCP API Error: {e.response.status_code}\n\n{e.response.text}"
-        )]
-    except httpx.ConnectError:
-        return [TextContent(
-            type="text",
-            text=f"❌ Cannot connect to UCP server at {UCP_BASE_URL}\n\nMake sure the flower shop server is running:\n```\ncd samples/rest/python/server\nuv run server.py --port=8182 ...\n```"
-        )]
     except Exception as e:
         return [TextContent(type="text", text=f"❌ Error: {type(e).__name__}: {e}")]
 
@@ -480,10 +636,11 @@ async def handle_health(request):
 async def handle_info(request):
     return JSONResponse({
         "name": "ucp-flower-shop",
-        "description": "MCP Server wrapping UCP Flower Shop REST API",
-        "ucp_endpoint": UCP_BASE_URL,
+        "description": "UCP Flower Shop MCP Server - Standalone demo with mock data",
         "transport": "HTTP/SSE",
         "sse_endpoint": "/sse",
+        "products": list(MOCK_PRODUCTS.keys()),
+        "discount_codes": list(DISCOUNT_CODES.keys()),
         "tools": [
             "ucp_discover",
             "ucp_list_products",
@@ -511,7 +668,6 @@ app = Starlette(
 
 
 if __name__ == "__main__":
-    import os
     import uvicorn
     
     port = int(os.environ.get("PORT", 8000))
@@ -524,18 +680,19 @@ if __name__ == "__main__":
 ║  Health:        http://localhost:{port}/health                     ║
 ║  Info:          http://localhost:{port}/info                       ║
 ║                                                                  ║
-║  UCP Backend:   {UCP_BASE_URL}                            ║
+║  Mode: STANDALONE (built-in mock data)                           ║
 ║                                                                  ║
-║  Tools:                                                          ║
-║    • ucp_discover        - Get merchant capabilities             ║
-║    • ucp_list_products   - Browse flower catalog                 ║
-║    • ucp_get_product     - Get product details                   ║
-║    • ucp_create_checkout - Start checkout session                ║
-║    • ucp_get_checkout    - View checkout state                   ║
-║    • ucp_update_checkout - Add shipping/discounts                ║
-║    • ucp_submit_checkout - Complete purchase                     ║
-║    • ucp_get_order       - View order details                    ║
-║    • ucp_list_orders     - List all orders                       ║
+║  Products:                                                       ║
+║    • bouquet_roses    - $35.00                                   ║
+║    • orchid_white     - $45.00                                   ║
+║    • tulips_mixed     - $28.00                                   ║
+║    • succulent_trio   - $22.00                                   ║
+║    • sunflower_bunch  - $25.00                                   ║
+║    • lily_bouquet     - $42.00                                   ║
+║    • pothos_golden    - $18.00                                   ║
+║    • peace_lily       - $32.00                                   ║
+║                                                                  ║
+║  Discount Codes: 10OFF, FLOWERS20, FREESHIP                      ║
 ╚══════════════════════════════════════════════════════════════════╝
     """)
     uvicorn.run(app, host="0.0.0.0", port=port)
