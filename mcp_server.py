@@ -457,55 +457,57 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 
 # ============ HTTP/SSE SERVER ============
-def create_app():
-    sse = SseServerTransport("/messages/")
-    
-    async def handle_sse(request):
-        async with sse.connect_sse(
-            request.scope, request.receive, request._send
-        ) as streams:
-            await server.run(
-                streams[0], streams[1], server.create_initialization_options()
-            )
-    
-    async def handle_messages(request):
-        await sse.handle_post_message(request.scope, request.receive, request._send)
-    
-    async def handle_health(request):
-        return JSONResponse({"status": "ok", "server": "ucp-flower-shop"})
-    
-    async def handle_info(request):
-        return JSONResponse({
-            "name": "ucp-flower-shop",
-            "description": "MCP Server wrapping UCP Flower Shop REST API",
-            "ucp_endpoint": UCP_BASE_URL,
-            "transport": "HTTP/SSE",
-            "sse_endpoint": "/sse",
-            "tools": [
-                "ucp_discover",
-                "ucp_list_products",
-                "ucp_get_product",
-                "ucp_create_checkout",
-                "ucp_get_checkout",
-                "ucp_update_checkout",
-                "ucp_submit_checkout",
-                "ucp_get_order",
-                "ucp_list_orders"
-            ]
-        })
-    
-    return Starlette(
-        debug=True,
-        routes=[
-            Route("/health", handle_health),
-            Route("/info", handle_info),
-            Route("/sse", handle_sse),
-            Route("/messages/", handle_messages, methods=["POST"]),
+sse_transport = SseServerTransport("/messages")
+
+
+async def handle_sse(request):
+    async with sse_transport.connect_sse(
+        request.scope, request.receive, request._send
+    ) as streams:
+        await server.run(
+            streams[0], streams[1], server.create_initialization_options()
+        )
+
+
+async def handle_messages(request):
+    await sse_transport.handle_post_message(request.scope, request.receive, request._send)
+
+
+async def handle_health(request):
+    return JSONResponse({"status": "ok", "server": "ucp-flower-shop"})
+
+
+async def handle_info(request):
+    return JSONResponse({
+        "name": "ucp-flower-shop",
+        "description": "MCP Server wrapping UCP Flower Shop REST API",
+        "ucp_endpoint": UCP_BASE_URL,
+        "transport": "HTTP/SSE",
+        "sse_endpoint": "/sse",
+        "tools": [
+            "ucp_discover",
+            "ucp_list_products",
+            "ucp_get_product",
+            "ucp_create_checkout",
+            "ucp_get_checkout",
+            "ucp_update_checkout",
+            "ucp_submit_checkout",
+            "ucp_get_order",
+            "ucp_list_orders"
         ]
-    )
+    })
 
 
-app = create_app()
+app = Starlette(
+    debug=True,
+    routes=[
+        Route("/health", handle_health),
+        Route("/info", handle_info),
+        Route("/sse", handle_sse),
+        Route("/messages", handle_messages, methods=["POST"]),
+        Route("/messages/", handle_messages, methods=["POST"]),
+    ]
+)
 
 
 if __name__ == "__main__":
